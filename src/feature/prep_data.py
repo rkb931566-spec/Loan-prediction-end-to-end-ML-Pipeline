@@ -1,0 +1,247 @@
+"""
+Data preprocessing pipeline for feature store ingestion.
+
+This module handles the transformation and preparation of raw data before ingestion
+into the feature store. It applies data cleaning, type conversions, validation,
+and formatting to ensure data quality and consistency.
+
+Workflow:
+    1. Load raw data from source
+    2. Apply preprocessing transformations (cleaning, validation)
+    3. Transform data into feature store schema format
+    4. Save preprocessed data in parquet file to be ingested by the feature store
+
+The processed data serves as input for the feature store, which then provides
+consistent, versioned features for both training and inference pipelines. The
+preprocessed data is saved to disk and can be ingested into the feature store
+via CI/CD pipelines using make setup_feast
+"""
+
+import argparse
+import logging
+from datetime import datetime
+from pathlib import PosixPath
+from typing import Tuple
+
+import pandas as pd
+
+from src.feature.schemas import (
+    Config,
+    DataConfig,
+    FeatureMappingsConfig,
+    FilesConfig,
+    build_feature_store_config,
+)
+from src.feature.utils.prep import DataPreprocessor, DataTransformer
+from src.utils.config_loader import load_config
+from src.utils.logger import get_logger
+from src.utils.path import DATA_DIR
+
+module_name: str = PosixPath(__file__).stem
+console_logger = get_logger(module_name)
+
+
+def import_data(
+    data_config: DataConfig, files_config: FilesConfig, data_dir: PosixPath
+) -> pd.DataFrame:
+    """Imports raw data to be preprocessed and transformed.
+
+    Args:
+        data_config: Data configuration parameters.
+        files_config: File configuration parameters.
+        data_dir: Path to the data directory.
+
+    Returns:
+        pd.DataFrame: Raw dataset.
+    """
+    raw_dataset = pd.read_parquet(path=data_dir / files_config.raw_dataset_file_name)
+    required_columns = (
+        [data_config.pk_col_name]
+        + data_config.date_col_names
+        + data_config.datetime_col_names
+        + data_config.num_col_names
+        + data_config.cat_col_names
+        + [data_config.class_col_name]
+    )
+    return raw_dataset[required_columns].copy()
+
+
+def preprocess_data(
+    raw_dataset: pd.DataFrame, data_config: DataConfig
+) -> Tuple[pd.DataFrame, DataPreprocessor]:
+    """Preprocesses raw data using a stateless DataPreprocessor.
+
+    The pipeline steps are specified explicitly and injected into the preprocessor,
+    so new steps can be added without modifying the class. The preprocessor instance is
+    returned to allow reuse of fitted parameters during transformation later.
+
+    Args:
+        raw_dataset: Raw dataset.
+        data_config: Data configuration parameters.
+
+    Returns:
+        Tuple[pd.DataFrame, DataPreprocessor]: Preprocessed dataset and the preprocessor instance
+    """
+    preprocessor = DataPreprocessor(
+        primary_key_names=[data_config.pk_col_name],
+        date_cols_names=data_config.date_col_names,
+        datetime_cols_names=data_config.datetime_col_names,
+        num_feature_names=data_config.num_col_names,
+        cat_feature_names=data_config.cat_col_names,
+        steps=[],  # start with empty pipeline and inject steps explicitly
+    )
+
+    # Specify steps explicitly in desired order
+    preprocessor.add_step(preprocessor.replace_blank_values_with_nan)
+    preprocessor.add_step(preprocessor.replace_common_missing_values)
+    preprocessor.add_step(preprocessor.check_duplicate_rows)
+    preprocessor.add_step(preprocessor.remove_duplicates_by_primary_key)
+    preprocessor.add_step(preprocessor.specify_data_types)
+    preprocessor.add_step(preprocessor.identify_cols_with_high_nans)
+
+    processed = preprocessor.run_preprocessing_pipeline(raw_dataset)
+
+    return processed, preprocessor
+
+
+def transform_data(
+    preprocessed_dataset: pd.DataFrame,
+    data_preprocessor: DataPreprocessor,
+    data_config: DataConfig,
+    feature_mappings: FeatureMappingsConfig,
+) -> pd.DataFrame:
+    """Transforms preprocessed data by mapping values and enriching data.
+
+    Args:
+        preprocessed_dataset: Preprocessed dataset.
+        data_preprocessor: Data preprocessor instance.
+        data_config: Data configuration parameters.
+        feature_mappings: Feature mappings configuration.
+
+    Returns:
+        pd.DataFrame: Transformed dataset.
+    """
+    data_transformer = DataTransformer(
+        preprocessed_data=preprocessed_dataset,
+        primary_key_names=data_preprocessor.primary_key_names,
+        date_cols_names=data_preprocessor.date_cols_names,
+        datetime_cols_names=data_preprocessor.datetime_cols_names,
+        num_feature_names=data_preprocessor.num_feature_names,
+        cat_feature_names=data_preprocessor.cat_feature_names,
+    )
+
+    # Map categorical features
+    if feature_mappings.mappings:
+        for column, _ in feature_mappings.mappings.items():
+            if column.endswith("_column"):
+                col_name = column.removesuffix("_column")
+                data_transformer.map_categorical_features(
+                    col_name=col_name,
+                    mapping_values=feature_mappings.mappings[f"{col_name}_values"],
+                )
+
+    # Map class labels
+    data_transformer.map_class_labels(
+        class_col_name=data_config.class_col_name,
+        mapping_values=feature_mappings.mappings.get("class_values", {}),
+    )
+
+    return data_transformer.preprocessed_data
+
+
+def save_transformed_data(
+    transformed_data: pd.DataFrame,
+    data_config: DataConfig,
+    files_config: FilesConfig,
+    data_dir: PosixPath,
+):
+    """Saves transformed data to disk to be used in the feature store.
+
+    Args:
+        transformed_data: Transformed dataset.
+        data_config: Data configuration parameters.
+        files_config: File configuration parameters.
+        data_dir: Path to the data directory.
+    """
+    # Save features
+    preprocessed_features = transformed_data.drop(
+        [data_config.class_col_name], axis=1, inplace=False
+    )
+    preprocessed_features[data_config.event_timestamp_col_name] = datetime.now()
+    preprocessed_features.to_parquet(
+        data_dir / files_config.preprocessed_data_features_file_name, index=False
+    )
+
+    # Save target
+    preprocessed_target = transformed_data[
+        [data_config.pk_col_name, data_config.class_col_name]
+    ].copy()
+    preprocessed_target[data_config.event_timestamp_col_name] = datetime.now()
+    preprocessed_target.to_parquet(
+        data_dir / files_config.preprocessed_data_target_file_name, index=False
+    )
+
+
+def main(config_yaml_path: str, data_dir: PosixPath, logger: logging.Logger) -> None:
+    """Main function to preprocess and transform raw data before saving it in the feature store through
+    CI/CD pipeline.
+
+    Args:
+        config_yaml_path: Path to the configuration YAML file.
+        data_dir: Path to the data directory.
+        logger: Logger object.
+    """
+    logger.info("Starting data preprocessing and transformation...")
+
+    # Load configuration parameters
+    config = load_config(
+        config_class=Config,
+        builder_func=build_feature_store_config,
+        config_path=config_yaml_path,
+    )
+
+    data_config = config.data
+    files_config = config.files
+    feature_mappings = config.feature_mappings
+
+    # Import raw dataset
+    raw_dataset = import_data(data_config, files_config, data_dir)
+    logger.info("Raw dataset imported.")
+
+    # Preprocess raw dataset
+    preprocessed_dataset, data_preprocessor = preprocess_data(raw_dataset, data_config)
+    logger.info("Raw dataset preprocessed.")
+
+    # Transform preprocessed dataset
+    transformed_data = transform_data(
+        preprocessed_dataset, data_preprocessor, data_config, feature_mappings
+    )
+    logger.info("Preprocessed dataset transformed.")
+
+    # Save transformed data
+    save_transformed_data(transformed_data, data_config, files_config, data_dir)
+    logger.info("Transformed data saved to disk.")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config_yaml_path",
+        type=str,
+        default="./config.yml",
+        help="Path to the configuration yaml file.",
+    )
+    parser.add_argument(
+        "--logger_path",
+        type=str,
+        default="./logger.conf",
+        help="Path to the logger configuration file.",
+    )
+    args = parser.parse_args()
+
+    # Get the logger object
+    console_logger.info("Starting preprocessing for the feature store...")
+
+    main(
+        config_yaml_path=args.config_yaml_path, data_dir=DATA_DIR, logger=console_logger
+    )
