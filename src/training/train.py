@@ -1,0 +1,545 @@
+"""
+Hyperparameter optimization and model training pipeline.
+
+This script handles the complete training pipeline:
+1. Loads and preprocesses data from feature store
+2. Trains models (e.g., LR, RF, LightGBM, XGBoost) selected in training-config.yml with Optuna optimization
+3. Logs experiments using MLflow (default) or Comet ML for tracking
+4. Saves trained models as pickle files
+5. Optionally runs evaluation workflow
+
+Experiments are automatically discoverable via the configured tracking backend.
+The pipeline supports both MLflow and Comet ML for experiment tracking.
+
+Data Prep Flow:
+1. split_data.py imports data from feature store and creates train/valid/test splits
+   - Saves data splits with class as parquet files in DATA_DIR.
+2. train.py loads the parquet files.
+3. prepare_data() encodes class labels using LabelEncoder
+4. Models are trained on encoded class labels.
+5. Encoded splits are saved back to parquet files for evaluation.
+"""
+
+import argparse
+import logging
+import os
+from datetime import datetime
+from pathlib import PosixPath
+from typing import List, Tuple
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# IMPORTANT: Set ENABLE_COMET_LOGGING=true in environment if using Comet ML tracker
+# This ensures comet_ml is imported before other ML libraries for proper auto-logging
+if os.getenv("ENABLE_COMET_LOGGING", "false").lower() == "true":
+    import comet_ml  # pylint: disable=unused-import
+
+import pandas as pd
+from sklearn.preprocessing import (
+    LabelEncoder,
+    MinMaxScaler,
+    RobustScaler,
+    StandardScaler,
+)
+
+from src.feature.utils.data import TrainingDataPrep
+from src.training.core.ensemble import ClassifierEnsembleOrchestrator
+from src.training.core.model_factory import build_estimator
+from src.training.core.trainer import TrainingOrchestrator
+from src.training.schemas import Config, build_training_config
+from src.training.tracking.experiment import (
+    create_experiment_manager,
+    get_tracker_credentials,
+    initialize_tracker_project,
+    should_initialize_tracker_project,
+)
+from src.utils.config_loader import load_config
+from src.utils.logger import get_logger
+from src.utils.path import ARTIFACTS_DIR, DATA_DIR, encoded_split_path
+
+module_name: str = PosixPath(__file__).stem
+console_logger = get_logger(module_name)
+
+
+def prepare_data(
+    config_yaml_path: str,
+    training_set: pd.DataFrame,
+    validation_set: pd.DataFrame,
+    testing_set: pd.DataFrame,
+    calibration_set: pd.DataFrame,
+) -> Tuple[
+    TrainingDataPrep,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    pd.Series,
+    List[str],
+    List[str],
+    LabelEncoder,
+    int,
+    pd.DataFrame,
+    pd.Series,
+]:
+    """Prepare data for training by preprocessing training and validation sets.
+
+    Note: This function loads data splits that were created by split_data.py.
+    The class labels come from the feature store as integers (0, 1) and are
+    encoded using LabelEncoder. The pos_class config parameter can be specified
+    as either string ("1") or integer (1) - it will be automatically converted
+    to match the data type.
+
+    Args:
+        config_yaml_path (str): path to config yaml file.
+        training_set (pd.DataFrame): training set.
+        validation_set (pd.DataFrame): validation set.
+        testing_set (pd.DataFrame): testing set.
+        calibration_set (pd.DataFrame): calibration set (used to calibrate the
+            champion and tune its decision threshold).
+
+    Returns:
+        data_prep (TrainingDataPrep): data preparation object.
+        data_transformation_pipeline (Pipeline): data transformation pipeline.
+        train_features (pd.DataFrame): preprocessed training features.
+        valid_features (pd.DataFrame): preprocessed validation features.
+        test_features (pd.DataFrame): preprocessed testing features.
+        train_class (pd.Series): training class labels.
+        valid_class (pd.Series): validation class labels.
+        test_class (pd.Series): testing class labels.
+        num_feature_names (List[str]): numerical feature names.
+        cat_feature_names (List[str]): categorical feature names.
+        class_encoder (LabelEncoder): class label encoder.
+        encoded_positive_class_label (int): encoded positive class label.
+        calib_features (pd.DataFrame): preprocessed calibration features.
+        calib_class (np.ndarray): encoded calibration class labels.
+    """
+
+    config = Config(config_path=config_yaml_path)
+    pk_col_name = config.params["data"]["pk_col_name"]
+    class_column_name = config.params["data"]["class_col_name"]
+    num_col_names = config.params["data"]["num_col_names"]
+    cat_col_names = config.params["data"]["cat_col_names"]
+    pos_class = config.params["data"]["pos_class"]
+
+    num_features_imputer = config.params["preprocessing"]["num_features_imputer"]
+    num_features_scaler = config.params["preprocessing"]["num_features_scaler"]
+    scaler_params = config.params["preprocessing"].get("scaler_params", {})
+    cat_features_imputer = config.params["preprocessing"]["cat_features_imputer"]
+    cat_features_ohe_handle_unknown = config.params["preprocessing"][
+        "cat_features_ohe_handle_unknown"
+    ]
+    cat_features_nans_replacement = config.params["preprocessing"][
+        "cat_features_nans_replacement"
+    ]
+    cat_features_min_frequency = config.params["preprocessing"].get(
+        "cat_features_min_frequency", 0.01
+    )
+    var_thresh_val = config.params["preprocessing"]["var_thresh_val"]
+
+    # Prepare data for training
+    data_prep = TrainingDataPrep(
+        train_set=training_set,
+        test_set=testing_set,
+        primary_key=pk_col_name,
+        class_col_name=class_column_name,
+        numerical_feature_names=num_col_names,
+        categorical_feature_names=cat_col_names,
+    )
+    # Pass the calibration set the same way as the validation set so it receives
+    # the same feature selection, type enforcement and name cleaning.
+    data_prep.extract_features(valid_set=validation_set, calib_set=calibration_set)
+    data_prep.enforce_data_types()
+
+    # Encode class labels
+    # Note: class encoder is fitted on train class labels and will be used
+    # to transform validation and test class labels.
+    (
+        train_class,
+        valid_class,
+        test_class,
+        encoded_positive_class_label,
+        class_encoder,
+    ) = data_prep.encode_class_labels(
+        pos_class_label=pos_class,
+    )
+
+    # Encode the calibration class labels with the same fitted encoder so they
+    # match the model's classes at calibration time.
+    calib_class = class_encoder.transform(calibration_set[class_column_name])
+
+    # Return features
+    train_features = data_prep.training_features
+    valid_features = data_prep.validation_features
+    test_features = data_prep.testing_features
+    calib_features = data_prep.calibration_features
+
+    # Define the mapping from strings to scaler classes
+    scaler_mapping = {
+        "robust": RobustScaler,
+        "standard": StandardScaler,
+        "minmax": MinMaxScaler,
+        "none": None,
+    }
+    scaler_class = scaler_mapping[num_features_scaler]
+    scaler_params = {k: v for d in scaler_params for k, v in d.items()}
+
+    # Create data transformation pipeline
+    data_transformation_pipeline = data_prep.create_data_transformation_pipeline(
+        num_features_imputer=num_features_imputer,
+        num_features_scaler=scaler_class(**scaler_params),
+        cat_features_imputer=cat_features_imputer,
+        cat_features_ohe_handle_unknown=cat_features_ohe_handle_unknown,
+        cat_features_nans_replacement=cat_features_nans_replacement,
+        cat_features_min_frequency=cat_features_min_frequency,
+        var_thresh_val=var_thresh_val,
+    )
+    data_prep.clean_up_feature_names()
+    num_feature_names, cat_feature_names = data_prep.get_feature_names()
+
+    return (
+        data_prep,
+        data_transformation_pipeline,
+        train_features,
+        valid_features,
+        test_features,
+        train_class,
+        valid_class,
+        test_class,
+        num_feature_names,
+        cat_feature_names,
+        class_encoder,
+        encoded_positive_class_label,
+        calib_features,
+        calib_class,
+    )
+
+
+def main(
+    config_yaml_path: str,
+    data_dir: PosixPath,
+    artifacts_dir: PosixPath,
+    logger: logging.Logger,
+    run_evaluation: bool = False,
+) -> pd.DataFrame:
+    """
+    Takes a config file as input and submits experiments to perform
+    hyperparameters optimization for multiple models.
+
+    Args:
+        config_yaml_path: Path to config yaml file.
+        data_dir: Path to data directory.
+        artifacts_dir: Path to artifacts directory.
+        logger: Logger object.
+        run_evaluation: Whether to run test evaluation after training.
+
+    Returns:
+        DataFrame containing experiment keys for successful experiments.
+
+    Raises:
+        ValueError: If no model specified in config file.
+        Exception: If evaluation fails when run_evaluation is True.
+    """
+
+    logger.info("Directory of training config file: %s", config_yaml_path)
+
+    # Get configuration parameters
+    config = Config(config_path=config_yaml_path)
+    training_config = load_config(
+        config_class=Config,
+        builder_func=build_training_config,
+        config_path=config_yaml_path,
+    )
+
+    # Get tracker configuration from training config
+    tracker_type = training_config.train_params.experiment_tracker
+    project_name = config.params["train"]["project_name"]
+    workspace_name = config.params["train"]["workspace_name"]
+    class_column_name = config.params["data"]["class_col_name"]
+    num_col_names = config.params["data"]["num_col_names"]
+    cat_col_names = config.params["data"]["cat_col_names"]
+
+    search_max_iters = config.params["train"]["search_max_iters"]
+    parallel_jobs_count = config.params["train"]["parallel_jobs_count"]
+    exp_timeout_in_secs = config.params["train"]["exp_timout_secs"]
+    f_beta_score_beta_val = config.params["train"]["fbeta_score_beta_val"]
+    comparison_metric = config.params["train"]["comparison_metric"]
+    search_rand_seed = int(config.params["data"]["split_rand_seed"])
+    ve_voting_rule = config.params["train"]["voting_rule"]
+    train_file_name = config.params["files"]["train_set_file_name"]
+    valid_set_file_name = config.params["files"]["valid_set_file_name"]
+    test_set_file_name = config.params["files"]["test_set_file_name"]
+    calib_set_file_name = config.params["files"]["calibration_set_file_name"]
+    ve_registered_model_name = config.params["modelregistry"][
+        "voting_ensemble_registered_model_name"
+    ]
+
+    # Import data splits
+    training_set = pd.read_parquet(
+        data_dir / train_file_name,
+    )
+
+    validation_set = pd.read_parquet(
+        data_dir / valid_set_file_name,
+    )
+
+    testing_set = pd.read_parquet(
+        data_dir / test_set_file_name,
+    )
+
+    calibration_set = pd.read_parquet(
+        data_dir / calib_set_file_name,
+    )
+
+    # Ensure that columns provided in config files exists in training data
+    num_col_names = [col for col in num_col_names if col in training_set.columns]
+    cat_col_names = [col for col in cat_col_names if col in training_set.columns]
+
+    # Prepare data for training
+    (
+        data_prep,
+        data_transformation_pipeline,
+        train_features,
+        valid_features,
+        test_features,
+        train_class,
+        valid_class,
+        test_class,
+        num_feature_names,
+        cat_feature_names,
+        class_encoder,
+        encoded_positive_class_label,
+        calib_features,
+        calib_class,
+    ) = prepare_data(
+        config_yaml_path=config_yaml_path,
+        training_set=training_set,
+        validation_set=validation_set,
+        testing_set=testing_set,
+        calibration_set=calibration_set,
+    )
+
+    # Preprocessed train and validation features are needed during hyperparams
+    # optimization to avoid applying data transformation in each iteration.
+    train_features_preprocessed = data_prep.train_features_preprocessed
+    valid_features_preprocessed = data_prep.valid_features_preprocessed
+
+    # Persist the feature-selected, label-encoded splits for evaluate.py to read.
+    # These are written to separate "*_encoded.parquet" files rather than
+    # overwriting the canonical splits from split_data.py, so re-running training
+    # is idempotent (it never reads back its own mutated, already-encoded input).
+    for features, class_labels, file_name in (
+        (train_features, train_class, train_file_name),
+        (valid_features, valid_class, valid_set_file_name),
+        (test_features, test_class, test_set_file_name),
+        (calib_features, calib_class, calib_set_file_name),
+    ):
+        encoded_split = features.copy()
+        encoded_split[class_column_name] = class_labels
+        encoded_split.to_parquet(
+            encoded_split_path(data_dir, file_name),
+            index=False,
+        )
+
+    # Get tracker credentials and initialize project if needed
+    try:
+        credentials = get_tracker_credentials(tracker_type)
+
+        # Check if project initialization is needed for this tracker
+        if should_initialize_tracker_project(tracker_type, config.params["train"]):
+            initialize_tracker_project(
+                tracker_type=tracker_type,
+                project_name=project_name,
+                workspace_name=workspace_name,
+                credentials=credentials,
+            )
+            logger.info("Initialized %s project: %s", tracker_type, project_name)
+
+        # Extract API key for backward compatibility with existing code
+        api_key = credentials.get("api_key")
+    except ValueError as e:
+        logger.warning("Could not get %s credentials: %s", tracker_type, e)
+        api_key = None
+
+    # Initialize training class
+    experiment_manager = create_experiment_manager(tracker_type)
+    model_trainer = TrainingOrchestrator(
+        experiment_manager=experiment_manager,
+        train_features=train_features,
+        train_class=train_class,
+        valid_features=valid_features,
+        valid_class=valid_class,
+        train_features_preprocessed=train_features_preprocessed,
+        valid_features_preprocessed=valid_features_preprocessed,
+        n_features=train_features_preprocessed.shape[1],
+        class_encoder=class_encoder,
+        preprocessor_step=data_transformation_pipeline.named_steps["preprocessor"],
+        selector_step=data_transformation_pipeline.named_steps["selector"],
+        artifacts_path=artifacts_dir,
+        supported_models=training_config.supported_models,
+        num_feature_names=num_feature_names,
+        cat_feature_names=cat_feature_names,
+        fbeta_score_beta=f_beta_score_beta_val,
+        encoded_pos_class_label=encoded_positive_class_label,
+        comparison_metric=comparison_metric,
+        random_seed=search_rand_seed,
+        task_type=training_config.train_params.task_type,
+        cv_folds=training_config.train_params.cross_val_folds,
+    )
+
+    #############################################
+    # Runtime values that config params can reference via "${name}" placeholders
+    # (e.g. XGBoost's class-imbalance weight, derived from the training labels).
+    # Guard the ratio so a degenerate (zero-positive) split yields 1.0 rather than
+    # inf / a divide-by-zero warning.
+    pos_count = int((train_class == 1).sum())
+    neg_count = int((train_class == 0).sum())
+    runtime_params = {
+        "scale_pos_weight": float(neg_count / pos_count) if pos_count else 1.0,
+    }
+
+    #############################################
+    # Train every enabled model. The model set is the config `models:` list, so
+    # adding a model is a new YAML entry: this loop and the factory are unchanged.
+    # trained_pipelines maps registered name -> calibrated pipeline (for the
+    # ensemble); exp_objects maps registered name -> experiment object.
+    trained_pipelines = {}
+    exp_objects = {}
+    for spec in training_config.models:
+        if not spec.enabled:
+            continue
+        logger.info("Training model '%s' (%s)", spec.name, spec.estimator)
+        # Underscore-normalize the run name (registered name keeps its hyphens);
+        # the Comet experiment-discovery matcher keys off underscored names.
+        run_label = spec.name.replace("-", "_")
+        calibrated_pipeline, experiment = model_trainer.run_training_experiment(
+            api_key=api_key,
+            project_name=project_name,
+            experiment_name=f"train_{run_label}_{datetime.now()}",
+            model=build_estimator(spec.estimator, spec.params, runtime_params),
+            search_space_params=spec.search_space_params,
+            max_search_iters=search_max_iters,
+            optimize_in_parallel=parallel_jobs_count > 1,
+            n_parallel_jobs=parallel_jobs_count,
+            model_opt_timeout_secs=exp_timeout_in_secs,
+            registered_model_name=spec.name,
+        )
+        trained_pipelines[spec.name] = calibrated_pipeline
+        exp_objects[spec.name] = experiment
+
+    #############################################
+    # Create a voting ensemble over the enabled base models
+    if training_config.ensemble.enabled:
+        available_pipelines = [p for p in trained_pipelines.values() if p is not None]
+        ve_orchestrator = ClassifierEnsembleOrchestrator(
+            experiment_manager=create_experiment_manager(tracker_type),
+            train_features=train_features,
+            valid_features=valid_features,
+            train_class=train_class,
+            valid_class=valid_class,
+            class_encoder=class_encoder,
+            artifacts_path=artifacts_dir,
+            supported_models=training_config.supported_models,
+            base_pipelines=available_pipelines,
+            voting_rule=ve_voting_rule,
+            encoded_pos_class_label=encoded_positive_class_label,
+            fbeta_score_beta=f_beta_score_beta_val,
+        )
+        _, ve_experiment = ve_orchestrator.create_voting_ensemble(
+            api_key=api_key,
+            project_name=project_name,
+            experiment_name=f"train_voting_ensemble_{datetime.now()}",
+            registered_model_name=ve_registered_model_name,
+        )
+        exp_objects[ve_registered_model_name] = ve_experiment
+
+    #############################################
+    # Select the best performer
+    exp_objects = {
+        key: value for key, value in exp_objects.items() if value is not None
+    }
+
+    if len(exp_objects) == 0:
+        raise ValueError(
+            "No model was selected in config for training or all training experiments failed."
+        )
+
+    # Create experiment DataFrame for return/evaluation
+    exp_names_keys = {}
+    for i in range(len(exp_objects)):
+        exp_key = list(exp_objects.keys())[i]
+        exp_value = list(exp_objects.values())[i]
+
+        # Handle different tracker types for getting experiment key/id
+        if training_config.train_params.experiment_tracker.lower() == "comet":
+            exp_id = exp_value.get_key()
+        elif training_config.train_params.experiment_tracker.lower() == "mlflow":
+            exp_id = exp_value.info.run_id
+        else:
+            raise ValueError(
+                f"Unsupported tracker type: {training_config.train_params.experiment_tracker}"
+            )
+
+        exp_names_keys.update(**{f"{exp_key}": exp_id})
+
+    successful_exp = pd.DataFrame(exp_names_keys.items())
+
+    logger.info("Model Training Experiments Finished ...")
+
+    # Optionally run test evaluation
+    if run_evaluation:
+        logger.info("Running test set evaluation ...")
+        from src.training.evaluate import main as evaluate_main
+
+        try:
+            champion_name, test_metrics = evaluate_main(
+                config_yaml_path=config_yaml_path,
+                data_dir=data_dir,
+                artifacts_dir=artifacts_dir,
+                logger=logger,
+                experiment_keys=successful_exp,
+            )
+            logger.info("Champion model: %s", champion_name)
+            logger.info("Test metrics: %s", test_metrics)
+        except Exception as e:  # pylint: disable=W0718
+            logger.error("Evaluation failed: %s", e)
+            raise
+
+    return successful_exp
+
+
+###########################################################
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train and optimize ML models with hyperparameter tuning."
+    )
+    parser.add_argument(
+        "--config_yaml_path",
+        type=str,
+        default="./config.yml",
+        help="Path to the configuration yaml file.",
+    )
+    parser.add_argument(
+        "--run_evaluation",
+        action="store_true",
+        help="Run test set evaluation after training.",
+    )
+
+    args = parser.parse_args()
+
+    console_logger.info("Hyperparameters Optimization Experiments Starts ...")
+
+    experiment_keys = main(
+        config_yaml_path=args.config_yaml_path,
+        data_dir=DATA_DIR,
+        artifacts_dir=ARTIFACTS_DIR,
+        logger=console_logger,
+        run_evaluation=args.run_evaluation,
+    )
+
+    console_logger.info(
+        "Training complete. %d successful experiments.", len(experiment_keys)
+    )
